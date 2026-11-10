@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import { MongoClient, ObjectId } from 'mongodb';
-import { jwtVerify } from 'jose';
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 
 dotenv.config();
 
@@ -12,28 +12,47 @@ app.use(cors());
 app.use(express.json());
 
 const uri = process.env.MONGO_URI;
-const client = new MongoClient(uri);
+let client = new MongoClient(uri);
 
-// jose needs the secret as bytes, so we encode it first
-const secret = new TextEncoder().encode(process.env.BETTER_AUTH_SECRET);
+let eventsCollection = client.db('greenLondon').collection('events');
+let reservationCollection = client.db('greenLondon').collection('reservation');
+let connectPromise;
+
+function resetMongoClient() {
+  client = new MongoClient(uri);
+  eventsCollection = client.db('greenLondon').collection('events');
+  reservationCollection = client.db('greenLondon').collection('reservation');
+}
+
+async function ensureMongoConnection(req, res, next) {
+  try {
+    if (client.topology?.isDestroyed()) {
+      resetMongoClient();
+      connectPromise = undefined;
+    }
+    connectPromise ??= client.connect();
+    await connectPromise;
+    next();
+  } catch (error) {
+    connectPromise = undefined;
+    resetMongoClient();
+    console.error('mongodb request failed', error);
+    res.status(503).json({ error: 'Database unavailable' });
+  }
+}
+
+const authBaseUrl = process.env.BETTER_AUTH_URL || 'http://localhost:3000';
+const authJwks = createRemoteJWKSet(new URL('/api/auth/jwks', authBaseUrl));
 
 async function run() {
   try {
-    await client.connect();
-    console.log('connected to mongodb');
-
-    const db = client.db('greenLondon');
-    const eventsCollection = db.collection('events');
-    const reservationCollection = db.collection('reservation');
-
-
     async function getUserFromToken(req) {
       try {
         const token = req.headers.authorization?.split(' ')[1];
         if (!token) {
           return null;
         }
-        const decoded = await jwtVerify(token, secret);
+        const decoded = await jwtVerify(token, authJwks);
         return decoded.payload;
       }
       catch (error) {
@@ -45,6 +64,8 @@ async function run() {
     app.get('/', (req, res) => {
       res.send('server is running');
     });
+
+    app.use(['/events', '/add_events', '/reservation'], ensureMongoConnection);
 
     app.post('/add_events', async (req, res) => {
       const user = await getUserFromToken(req);
@@ -77,12 +98,31 @@ async function run() {
       const query = upcomingOnly
         ? { eventDate: { $gte: new Date().toISOString().slice(0, 10) } }
         : {};
+
+      if (req.query.creatorEmail) {
+        const user = await getUserFromToken(req);
+        if (!user?.email) {
+          return res.status(401).json({ error: 'You must be logged in to manage events' });
+        }
+        query.creatorEmail = user.email;
+      }
+
       const cursor = eventsCollection.find(query);
       if (upcomingOnly) {
         cursor.sort({ eventDate: 1 });
       }
       const allEvents = await cursor.toArray();
       res.send(allEvents);
+    });
+
+    app.get('/events/featured', async (req, res) => {
+      const today = new Date().toISOString().slice(0, 10);
+      const featuredEvents = await eventsCollection
+        .find({ eventDate: { $gte: today } })
+        .sort({ eventDate: 1 })
+        .limit(6)
+        .toArray();
+      res.send(featuredEvents);
     });
 
     app.get('/events/:id', async (req, res) => {
@@ -157,7 +197,16 @@ async function run() {
     });
 
     app.get('/reservation', async (req, res) => {
-      const reservations = await reservationCollection.find().toArray();
+      const user = await getUserFromToken(req);
+
+      if (!user?.email) {
+        return res.status(401).json({ error: 'You must be logged in to view joined events' });
+      }
+
+      const reservations = await reservationCollection.find({
+        $or: [{ userEmail: user.email }, { email: user.email }],
+        eventId: { $exists: true, $ne: null }
+      }).toArray();
       res.send(reservations);
     });
   }
@@ -168,6 +217,12 @@ async function run() {
 
 run();
 
-app.listen(5050, () => {
-  console.log('server is running on port 5050');
-});
+// Vercel invokes the exported Express app as a serverless handler. Keep the
+// local listener for running this service directly during development.
+if (process.env.VERCEL !== '1') {
+  app.listen(5050, () => {
+    console.log('server is running on port 5050');
+  });
+}
+
+export default app;
